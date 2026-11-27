@@ -1,0 +1,629 @@
+// 프로젝트 탭 위쪽: 직접 만든 프로젝트 카드와 ＋ 만들기 창(새로 만들기 · 일정에서 가져오기).
+// 카드 위계: 머리(이름 · ✓ 끝내기 아이콘 · ⋯ 메뉴) → 기한 배지(D-n, 3일 안 주황·지나면 빨강)·날짜·📅 출처 칩 → 진행 막대 → 메모(두 줄)
+// → 묶인 열린 할 일(체크로 끝내기, ✕로 빼기) → 「＋ 할 일」 한 줄. ⋯ 메뉴: 고치기·위로·아래로·끝내기·지우기(확인 한 번).
+// ＋ 할 일: 누르면 그 자리에 입력칸(Enter 로 추가하고 계속 입력, Esc·바깥 누르기로 닫힘), 옆에 「기존 할 일」 찾기 메뉴. 빈 프로젝트는 낮은 카드.
+// 할 일 줄: 두 번 누르거나 ✎ 로 그 자리 이름 바꾸기(할 일 탭과 같은 POST /todos/:id), 손잡이를 끌거나 ↑↓(손잡이에서 ↑↓ 키)로 순서 바꾸기.
+// 손잡이·줄 도구는 마우스를 올리거나 키보드로 갔을 때만 보인다(projects.css).
+// 카드끼리: 진행 중 카드 왼쪽 손잡이를 끌거나(몇 px 움직여야 시작, 놓을 자리는 점선, 다른 카드는 비켜 준다) 손잡이에서 화살표 키, ⋯ 메뉴 위로·아래로
+// 순서 바꾸기(POST /projects/manual/order). 끌기는 포인터 이벤트 + setPointerCapture 만 쓴다(HTML5 drag-and-drop 은 Electron 윈도우에서
+// 커서·투명창 문제가 있어 안 쓴다). 맥·윈도우 같은 코드. Esc·창 밖·포커스 잃음·pointercancel 이면 원래 순서로 취소.
+// 데이터는 GET /dashboard 의 manualProjects(src/manual-projects.js 가 다듬은 vm.manualProjects)이고, 바꾼 뒤엔 onChanged 로 다시 읽는다.
+import { who } from './who.js';
+import { t as tr } from '../src/i18n.js';
+import { progressText, dateRangeText, emptyDraft, draftFromPick, draftOf, createBody, editBody, eventWhen, shapePick, applyOrder, moveId, stepId, dropSlot, sameOrder, gridSlot, pastDragStart } from '../src/manual-projects.js';
+import { editKey, editPatch } from '../src/todo-edit.js';
+import { createUi } from './ui-kit.js';
+
+export const FOLD_AT = 5; // 카드에 처음 보이는 할 일 수. 넘으면 「N개 더 보기」
+
+export function createProjectsView({ h, cy, fill, onChanged, openSettings }) {
+  let vm = null;
+  let msg = null; // { ok, text } — 카드 위 한 줄
+  const busy = new Set(); // 응답 기다리는 프로젝트 id
+  let confirmDel = null; // 지우기 확인 중인 프로젝트 id
+  const addDrafts = new Map(); // 프로젝트 id → 할 일 추가 칸 글
+  let adding = null; // ＋ 할 일 칸을 연 프로젝트 id(한 번에 하나)
+  const expanded = new Set(); // 「N개 더 보기」로 펼친 프로젝트 id(할 일이 FOLD_AT 개 넘으면 접어 옆 카드와 높이를 맞춘다. 상한 아님)
+  let addBox = null; // 그 칸(바깥 누르기 판단)
+  const ui = createUi({ h, fill });
+  let modal = null; // { step: 'choose'|'events'|'form', mode: 'new'|'edit', id?, draft, error, saving, pick? }
+  let root = null; // 만들기 창 겉(body 끝에 붙인다)
+  let redrawCards = () => {};
+  // 응답 오기 전 화면: 프로젝트 id → { ids, saved } 순서 · 할 일 id → { title, saved } 이름. 저장된 뒤 새 대시보드가 오면 버린다
+  const orders = new Map();
+  const titles = new Map();
+  let editing = null; // { pid, tid, value }: 이름 바꾸는 줄
+  let drag = null; // { pid, tid, ids, start, ul, ghost }: 끄는 중
+  let refocus = null; // 다시 그린 뒤 포커스할 { pid, tid, kind }
+  let redrawing = false; // 카드를 다시 그려 갈아 끼우는 중
+  const rowEls = new Map(); // 이번 그림의 'kind:tid' → 버튼·칸
+  // 카드끼리 순서: 응답 전 화면 { ids, saved } · 저장 중 · 끄는 중 { pid, ids, start, pointerId, x0, y0, started, ghost, cap }
+  let cardOrder = null;
+  let orderBusy = false;
+  let cardDrag = null;
+  const cardEls = new Map(); // 이번 그림의 프로젝트 id → 카드(article)
+
+  const why = (r) => (typeof r?.data?.error === 'string' ? r.data.error : r?.status ? `HTTP ${r.status}` : tr('panel.pv1', { who: who() }));
+  let msgTimer = null;
+  const say = (ok, text) => {
+    msg = { ok, text };
+    clearTimeout(msgTimer);
+    if (ok) { msgTimer = setTimeout(() => { msg = null; redrawCards(); }, 4000); msgTimer?.unref?.(); } // 잘 된 알림은 잠깐만
+    redrawCards();
+  };
+
+  async function act(id, call, failText, okText) {
+    if (id) busy.add(id);
+    msg = null;
+    redrawCards();
+    let r;
+    try { r = await call(); } catch { r = { ok: false }; }
+    if (id) busy.delete(id);
+    if (r?.ok) { if (okText) say(true, okText); onChanged(); }
+    else msg = { ok: false, text: `${failText}: ${why(r)}` };
+    redrawCards();
+    return r;
+  }
+
+  // ---- 카드 ----
+  function section(v, rerender) {
+    if (v !== vm) { // 새 대시보드: 저장이 끝난 덮어보기는 버린다(서버가 같은 걸 준다)
+      for (const [k, o] of orders) if (o.saved) orders.delete(k);
+      for (const [k, o] of titles) if (o.saved) titles.delete(k);
+      if (cardOrder?.saved) cardOrder = null;
+    }
+    vm = v;
+    redrawCards = rerender;
+    // 다시 그리면 줄이 새로 생기니, 지금 포커스가 줄 안 버튼이면 새 줄의 같은 버튼으로 옮긴다
+    const active = typeof document !== 'undefined' ? document.activeElement : null;
+    if (active && !refocus) for (const [k, x] of rowEls) if (x.el === active) { const [kind, ...rest] = k.split(':'); refocus = { pid: x.pid, tid: rest.join(':'), kind }; break; }
+    rowEls.clear();
+    cardEls.clear();
+    // 패널이 이 그림으로 갈아 끼우는 동안 빠지는 이름 칸의 blur 는 저장으로 치지 않는다(바로 새 칸으로 포커스)
+    redrawing = true;
+    queueMicrotask(() => { redrawing = false; });
+    if (refocus || editing) queueMicrotask(focusAfter);
+    const list = vm.manualProjects ?? [];
+    const kids = [
+      h('div.mp-head', null,
+        h('h2.mp-title', { text: tr('panel.pv2') }),
+        h('span.spacer'),
+        h('button.primary.mp-new', { type: 'button', title: tr('panel.pv3'), 'aria-label': tr('panel.pv4'), onclick: openCreate }, tr('panel.pv5'))),
+    ];
+    if (msg) kids.push(h(`div.result.${msg.ok ? 'ok' : 'err'}`, { role: 'status', text: msg.text }));
+    if (!list.length) {
+      kids.push(h('div.card.mp-empty', null, ui.emptyState({
+        icon: '🗂', text: tr('panel.pv6'),
+        sub: tr('panel.pv7'),
+        action: h('button.mp-empty-btn', { type: 'button', onclick: openCreate }, tr('panel.pv5')),
+      })));
+    } else {
+      const open = openCards(list), done = list.filter((p) => p.done);
+      if (open.length) kids.push(h(`div.projects.mp-list.mp-open${cardDrag?.started ? '.is-sorting' : ''}`, null, open.map((p, i) => card(p, i, open.length))));
+      if (done.length) kids.push(h('h3.mp-sub', { text: tr('panel.pv8', { n: done.length }) }), h('div.projects.mp-list.done', null, done.map((p) => card(p))));
+    }
+    return kids;
+  }
+
+  // ---- 카드끼리 순서 ----
+  const openCards = (list) => applyOrder(list.filter((p) => !p.done), cardDrag?.started ? cardDrag.ids : cardOrder?.ids);
+  const openIds = () => openCards(vm?.manualProjects ?? []).map((p) => p.id);
+  // 카드 자리(변형·움직임과 상관없는 배치 자리): 그리드 기준 offset + 그리드의 화면 자리
+  function cardRects() {
+    return openIds().map((id) => {
+      const el = cardEls.get(id);
+      if (!el) return null;
+      const g = el.offsetParent?.getBoundingClientRect?.() ?? { left: 0, top: 0 };
+      return { id, left: g.left + (el.offsetLeft ?? 0), top: g.top + (el.offsetTop ?? 0), width: el.offsetWidth ?? 0, height: el.offsetHeight ?? 0 };
+    }).filter(Boolean);
+  }
+  // 다른 카드가 새 자리로 미끄러지게(FLIP). 움직임 줄이기 설정이면 그냥 바뀐다
+  function slide(change) {
+    const reduce = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const before = reduce ? [] : cardRects();
+    change();
+    if (!before.length) return;
+    const after = new Map(cardRects().map((r) => [r.id, r]));
+    for (const b of before) {
+      const a = after.get(b.id), el = cardEls.get(b.id);
+      if (!a || !el || typeof el.animate !== 'function' || b.id === cardDrag?.pid) continue;
+      const dx = b.left - a.left, dy = b.top - a.top;
+      if (dx || dy) el.animate([{ transform: `translate(${dx}px, ${dy}px)` }, { transform: 'none' }], { duration: 160, easing: 'cubic-bezier(0.2, 0.7, 0.3, 1)' });
+    }
+  }
+  function saveCardOrder(ids, before) {
+    if (sameOrder(ids, before)) { redrawCards(); return; }
+    const prev = cardOrder; // 실패하면 바로 앞 화면으로
+    cardOrder = { ids, saved: false };
+    orderBusy = true;
+    act(null, async () => { try { return await cy.projectsOrder(ids); } finally { orderBusy = false; } }, tr('panel.pv9')).then((r) => {
+      if (r?.ok) { if (cardOrder?.ids === ids) cardOrder.saved = true; } else { cardOrder = prev; slide(redrawCards); }
+    });
+  }
+  function stepCard(p, delta, kind) {
+    if (orderBusy || cardDrag) return;
+    const ids = openIds();
+    const next = stepId(ids, p.id, delta);
+    if (!next) return;
+    refocus = { pid: p.id, tid: p.id, kind };
+    slide(() => saveCardOrder(next, ids));
+  }
+  // 끌기: ⋮⋮ 를 누르면 준비만 하고, 문턱(몇 px)을 넘게 움직이면 시작. 포인터는 body 가 잡아(setPointerCapture) 창 밖·다시 그리기에도 안 놓친다
+  function cardPointerDown(p, e) {
+    if (e.button !== 0 || orderBusy || cardDrag || drag || editing) return;
+    const ids = openIds();
+    if (ids.length < 2) return;
+    e.preventDefault(); // 글자 고르기·포커스 이동 대신 끌기
+    const cap = document.body;
+    try { cap?.setPointerCapture?.(e.pointerId); } catch { /* 이미 뗀 포인터 */ }
+    cardDrag = { pid: p.id, ids, start: ids, pointerId: e.pointerId, x0: e.clientX, y0: e.clientY, started: false, ghost: null, cap };
+    document.addEventListener('pointermove', onCardMove, true);
+    document.addEventListener('pointerup', onCardUp, true);
+    document.addEventListener('pointercancel', onCardCancel, true);
+    document.addEventListener('keydown', onCardKey, true);
+    cap?.addEventListener?.('lostpointercapture', onCardCancel);
+    if (typeof window !== 'undefined') window.addEventListener?.('blur', onCardCancel);
+  }
+  const samePointer = (e) => e.pointerId === undefined || cardDrag?.pointerId === undefined || e.pointerId === cardDrag.pointerId;
+  function onCardMove(e) {
+    const d = cardDrag;
+    if (!d || !samePointer(e)) return;
+    if (e.buttons === 0) { onCardCancel(); return; } // 떼는 걸 놓쳤다(창 밖에서 뗌 등)
+    if (!d.started) {
+      if (!pastDragStart(e.clientX - d.x0, e.clientY - d.y0)) return;
+      d.started = true;
+      const p = (vm.manualProjects ?? []).find((x) => x.id === d.pid);
+      d.ghost = h('div.mp-drag-ghost.mp-card-ghost', { text: p?.name ?? '', 'aria-hidden': 'true' });
+      document.body.append(d.ghost);
+      redrawCards();
+    }
+    e.preventDefault();
+    const w = typeof window !== 'undefined' ? window : null;
+    if (w && Number.isFinite(w.innerWidth) && (e.clientX < 0 || e.clientY < 0 || e.clientX > w.innerWidth || e.clientY > w.innerHeight)) { onCardCancel(); return; } // 창 밖
+    if (d.ghost.style) { d.ghost.style.left = `${e.clientX}px`; d.ghost.style.top = `${e.clientY}px`; }
+    const next = moveId(d.ids, d.pid, gridSlot(cardRects(), d.pid, e.clientX, e.clientY));
+    if (!sameOrder(next, d.ids)) { d.ids = next; slide(redrawCards); }
+  }
+  function endCardDrag() {
+    const d = cardDrag;
+    cardDrag = null;
+    document.removeEventListener('pointermove', onCardMove, true);
+    document.removeEventListener('pointerup', onCardUp, true);
+    document.removeEventListener('pointercancel', onCardCancel, true);
+    document.removeEventListener('keydown', onCardKey, true);
+    d?.cap?.removeEventListener?.('lostpointercapture', onCardCancel);
+    if (typeof window !== 'undefined') window.removeEventListener?.('blur', onCardCancel);
+    try { if (d?.cap?.hasPointerCapture?.(d.pointerId)) d.cap.releasePointerCapture(d.pointerId); } catch { /* 이미 풀림 */ }
+    d?.ghost?.remove();
+    return d;
+  }
+  function onCardUp(e) {
+    if (!cardDrag || !samePointer(e)) return;
+    const d = endCardDrag();
+    if (!d.started) return; // 누르기만 했다(클릭)
+    refocus = { pid: d.pid, tid: d.pid, kind: 'card-grip' };
+    saveCardOrder(d.ids, d.start);
+  }
+  function onCardCancel() {
+    const d = endCardDrag();
+    if (d?.started) slide(redrawCards);
+  }
+  function onCardKey(e) {
+    if (e.key !== 'Escape') return;
+    e.preventDefault();
+    e.stopPropagation(); // 패널 닫기(Esc)보다 먼저 끌기만 그만
+    onCardCancel();
+  }
+
+  // ---- 할 일 줄: 이름 바꾸기·순서 바꾸기 ----
+  const linkedOf = (p) => applyOrder(p.linked, drag?.pid === p.id ? drag.ids : orders.get(p.id)?.ids).map((t) => (titles.has(t.id) ? { ...t, title: titles.get(t.id).title } : t));
+  // 다시 그린 뒤 포커스: 이름 칸, 아니면 방금 누른 버튼(못 누르게 됐으면 손잡이·✎). 응답 기다리는 동안은 미뤄 둔다
+  function focusAfter() {
+    if (editing) {
+      const el = rowEls.get(`edit:${editing.tid}`)?.el;
+      el?.focus?.();
+      if (el?.setSelectionRange) el.setSelectionRange(el.value.length, el.value.length);
+      return;
+    }
+    if (!refocus || (busy.has(refocus.pid) && refocus.kind !== 'add') || (orderBusy && refocus.kind.startsWith('card-'))) return;
+    const { tid, kind } = refocus;
+    refocus = null;
+    const el = (kind.startsWith('card-') ? [kind, 'card-menu', 'card-grip'] : kind.startsWith('add') ? [kind, 'add', 'add-open'] : [kind, 'grip', 'rename']).map((k) => rowEls.get(`${k}:${tid}`)?.el).find((x) => x && !x.disabled);
+    el?.focus?.();
+    if (kind === 'add' && el?.setSelectionRange) el.setSelectionRange(el.value.length, el.value.length);
+  }
+  function startRename(p, t) {
+    if (busy.has(p.id) || drag) return;
+    editing = { pid: p.id, tid: t.id, value: t.title };
+    redrawCards();
+  }
+  function finishRename(save) {
+    const e = editing;
+    if (!e) return;
+    editing = null;
+    refocus = { pid: e.pid, tid: e.tid, kind: 'rename' };
+    const p = (vm.manualProjects ?? []).find((x) => x.id === e.pid);
+    const t = p && linkedOf(p).find((x) => x.id === e.tid);
+    if (!save || !t) { redrawCards(); return; }
+    const { patch, notice } = editPatch(t, { title: e.value, desc: '', descBase: '' });
+    if (notice) { say(false, tr('panel.pv10')); return; }
+    if (!patch) { redrawCards(); return; }
+    const prev = titles.get(t.id);
+    titles.set(t.id, { title: patch.title, saved: false });
+    act(p.id, () => cy.todoEdit(t.id, { title: patch.title }), tr('panel.pv11')).then((r) => {
+      if (r?.ok) { const o = titles.get(t.id); if (o) o.saved = true; } else { if (prev) titles.set(t.id, prev); else titles.delete(t.id); redrawCards(); }
+    });
+  }
+  function saveOrder(p, ids, before) {
+    if (sameOrder(ids, before)) { redrawCards(); return; }
+    const prev = orders.get(p.id); // 실패하면 바로 앞 화면으로
+    orders.set(p.id, { ids, saved: false });
+    act(p.id, () => cy.projectOrder(p.id, ids), tr('panel.pv12')).then((r) => {
+      if (r?.ok) { const o = orders.get(p.id); if (o) o.saved = true; } else { if (prev) orders.set(p.id, prev); else orders.delete(p.id); redrawCards(); }
+    });
+  }
+  function step(p, t, delta, kind) {
+    expanded.add(p.id); // 접힌 줄로 옮겨도 보이게
+    const ids = linkedOf(p).map((x) => x.id);
+    const next = stepId(ids, t.id, delta);
+    if (!next) return;
+    refocus = { pid: p.id, tid: t.id, kind };
+    saveOrder(p, next, ids);
+  }
+  // 끌기: ⋮⋮ 를 누르면 바로 시작. 줄 자리는 점선으로 비워 두고(끄는 중 자리 표시) 포인터를 따라 다른 줄을 밀어낸다
+  function startDrag(p, t, e) {
+    expanded.add(p.id);
+    if (e.button !== 0 || busy.has(p.id) || editing || cardDrag) return;
+    e.preventDefault();
+    const ids = linkedOf(p).map((x) => x.id);
+    if (ids.length < 2) return;
+    const ghost = h('div.mp-drag-ghost', { text: t.title, 'aria-hidden': 'true' });
+    if (ghost.style) { ghost.style.left = `${e.clientX}px`; ghost.style.top = `${e.clientY}px`; }
+    document.body.append(ghost);
+    drag = { pid: p.id, tid: t.id, ids, start: ids, ul: null, ghost };
+    document.addEventListener('pointermove', onDragMove, true);
+    document.addEventListener('pointerup', onDragEnd, true);
+    document.addEventListener('pointercancel', onDragCancel, true);
+    document.addEventListener('keydown', onDragKey, true);
+    redrawCards();
+  }
+  function onDragMove(e) {
+    if (!drag) return;
+    e.preventDefault();
+    if (drag.ghost.style) { drag.ghost.style.left = `${e.clientX}px`; drag.ghost.style.top = `${e.clientY}px`; }
+    const rows = [...(drag.ul?.children ?? [])].map((li) => { const r = li.getBoundingClientRect(); return { id: li.dataset.tid, mid: r.top + r.height / 2 }; });
+    const next = moveId(drag.ids, drag.tid, dropSlot(rows, drag.tid, e.clientY));
+    if (!sameOrder(next, drag.ids)) { drag.ids = next; redrawCards(); }
+  }
+  function endDrag() {
+    const d = drag;
+    drag = null;
+    document.removeEventListener('pointermove', onDragMove, true);
+    document.removeEventListener('pointerup', onDragEnd, true);
+    document.removeEventListener('pointercancel', onDragCancel, true);
+    document.removeEventListener('keydown', onDragKey, true);
+    d?.ghost.remove();
+    return d;
+  }
+  function onDragEnd() {
+    const d = endDrag();
+    if (!d) return;
+    const p = (vm.manualProjects ?? []).find((x) => x.id === d.pid);
+    refocus = { pid: d.pid, tid: d.tid, kind: 'grip' };
+    if (p) saveOrder(p, d.ids, d.start); else redrawCards();
+  }
+  function onDragCancel() { if (endDrag()) redrawCards(); }
+  function onDragKey(e) {
+    if (e.key !== 'Escape') return;
+    e.preventDefault();
+    e.stopPropagation(); // 패널 닫기(Esc)보다 먼저 끌기만 그만
+    onDragCancel();
+  }
+
+  function todoRow(p, t, i, n, wait) {
+    const keep = (kind, el) => { rowEls.set(`${kind}:${t.id}`, { el, pid: p.id }); return el; };
+    const dragging = drag?.tid === t.id;
+    if (editing?.tid === t.id && editing.pid === p.id) {
+      const input = h('input.mp-edit', {
+        type: 'text', value: editing.value, 'aria-label': tr('panel.pv13', { title: t.title }), placeholder: tr('panel.pv14'),
+        oninput: (e) => { if (editing?.tid === t.id) editing.value = e.target.value; },
+        onkeydown: (e) => { const k = editKey(e, 'title'); if (!k) return; e.preventDefault(); e.stopPropagation(); finishRename(k === 'save'); },
+        onblur: (e) => { if (editing?.tid === t.id && !redrawing && e.target.isConnected !== false) finishRename(true); }, // 다시 그려서 빠진 칸은 저장하지 않는다
+      });
+      input.value = editing.value;
+      return h('li.mp-row.editing', { dataset: { tid: t.id } }, keep('edit', input),
+        h('span.mp-edit-hint.muted.small', { text: tr('panel.pv15') }));
+    }
+    // 손잡이(⋮⋮)는 줄 왼쪽 여백에 떠 있고 마우스를 올리거나 키보드로 갔을 때만 보인다. 도구(✎ ↑ ↓ ✕)도 같다
+    return h(`li.mp-row${dragging ? '.mp-dragging' : ''}`, { dataset: { tid: t.id } },
+      n > 1 ? keep('grip', h('button.ghost.mp-grip', {
+        type: 'button', title: tr('panel.pv16'), 'aria-label': tr('panel.pv17', { title: t.title, i: i + 1, n }), disabled: wait,
+        onpointerdown: (e) => startDrag(p, t, e),
+        onkeydown: (e) => {
+          if (e.isComposing || (e.key !== 'ArrowUp' && e.key !== 'ArrowDown')) return;
+          e.preventDefault();
+          step(p, t, e.key === 'ArrowUp' ? -1 : 1, 'grip');
+        },
+      }, h('span.grip-dots', { 'aria-hidden': 'true' }))) : null,
+      h('button.ghost.mp-check', { type: 'button', title: tr('panel.pv18'), 'aria-label': tr('panel.pv19', { title: t.title }), disabled: wait, onclick: () => act(p.id, () => cy.todoDone(t.id), tr('panel.pv20')) }, h('span.ring', { 'aria-hidden': 'true' })),
+      h('span.t', { text: t.title, title: tr('panel.pv21', { title: t.title }), ondblclick: () => startRename(p, t) }),
+      h('span.mp-tools', null,
+        keep('rename', ui.iconBtn('mp-rename', { label: tr('panel.pv13', { title: t.title }), title: tr('panel.pv22'), icon: '✎', size: 's', disabled: wait, onclick: () => startRename(p, t) })),
+        n > 1 ? keep('up', ui.iconBtn('mp-up', { label: tr('panel.pv23', { title: t.title }), title: tr('panel.pv24'), icon: '↑', size: 's', disabled: wait || i === 0, onclick: () => step(p, t, -1, 'up') })) : null,
+        n > 1 ? keep('down', ui.iconBtn('mp-down', { label: tr('panel.pv25', { title: t.title }), title: tr('panel.pv26'), icon: '↓', size: 's', disabled: wait || i === n - 1, onclick: () => step(p, t, 1, 'down') })) : null,
+        ui.iconBtn('mp-unlink', { label: tr('panel.pv27', { title: t.title }), title: tr('panel.pv28'), icon: '✕', size: 's', disabled: wait, onclick: () => act(p.id, () => cy.todoEdit(t.id, { projectId: null }), tr('panel.pv29')) })));
+  }
+
+  // ---- ＋ 할 일: 누르면 그 자리에 입력칸(Enter 추가·계속 입력, Esc·바깥 누르기로 닫힘), 옆에 「기존 할 일」 찾기 메뉴 ----
+  function openAdd(p) {
+    if (busy.has(p.id) && adding === p.id) return;
+    adding = p.id;
+    refocus = { pid: p.id, tid: p.id, kind: 'add' };
+    document.addEventListener?.('pointerdown', onAddOutside, true);
+    redrawCards();
+  }
+  function closeAdd(focusBack = true) {
+    const pid = adding;
+    if (!pid) return;
+    adding = null;
+    addBox = null;
+    document.removeEventListener?.('pointerdown', onAddOutside, true);
+    if (focusBack) refocus = { pid, tid: pid, kind: 'add-open' };
+    redrawCards();
+  }
+  function onAddOutside(e) {
+    const t = e?.target;
+    if (!adding || (addBox && addBox.contains?.(t)) || t?.closest?.('.ui-menu')) return;
+    closeAdd(false);
+  }
+  function addRow(p, wait, others) {
+    if (adding !== p.id) {
+      return keepAdd(p, 'add-open', h('button.ghost.mp-add-open', { type: 'button', 'aria-label': tr('panel.pv30', { name: p.name }), title: tr('panel.pv31'), onclick: () => openAdd(p) },
+        h('span.plus', { 'aria-hidden': 'true', text: '＋' }), h('span', { text: tr('panel.pv32') })));
+    }
+    const add = (input) => {
+      const title = String(input.value ?? '').replace(/\s+/g, ' ').trim();
+      if (!title) return;
+      addDrafts.delete(p.id);
+      input.value = '';
+      refocus = { pid: p.id, tid: p.id, kind: 'add' };
+      act(p.id, () => cy.todoAdd({ title, priority: 2, projectId: p.id }), tr('panel.pv33'));
+    };
+    const input = keepAdd(p, 'add', h('input.mp-add-input', {
+      type: 'text', placeholder: tr('panel.pv34'), 'aria-label': tr('panel.pv35', { name: p.name }), value: addDrafts.get(p.id) ?? '',
+      oninput: (e) => addDrafts.set(p.id, e.target.value),
+      onkeydown: (e) => {
+        if (e.isComposing) return;
+        if (e.key === 'Enter') { e.preventDefault(); add(e.target ?? input); }
+        else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeAdd(); } // 패널 닫기보다 먼저
+      },
+    }));
+    input.value = addDrafts.get(p.id) ?? '';
+    const pick = others.length
+      ? ui.menuButton('mp-pick', {
+        label: tr('panel.pv36', { name: p.name }), title: tr('panel.pv37'), text: tr('panel.pv38'), size: 's', disabled: wait,
+        search: tr('panel.pv39'), empty: tr('panel.pv40'),
+        items: () => others.map((t) => {
+          const at = t.projectId ? (vm.manualProjects ?? []).find((x) => x.id === t.projectId) : null; // 다른 프로젝트에 있으면 옮긴다
+          return { label: t.title, hint: at ? tr('panel.pv41', { name: at.name }) : '', onSelect: () => { refocus = { pid: p.id, tid: p.id, kind: 'add' }; act(p.id, () => cy.todoEdit(t.id, { projectId: p.id }), tr('panel.pv42')); } };
+        }),
+      })
+      : null;
+    addBox = h('div.mp-add', null, input, pick, h('span.mp-add-hint', { text: tr('panel.pv43') }));
+    return addBox;
+  }
+  const keepAdd = (p, kind, el) => { rowEls.set(`${kind}:${p.id}`, { el, pid: p.id }); return el; };
+
+  // ---- 카드 ----
+  // 위계: 머리(이름 · ✓ 끝내기 · ⋯) → 기한 배지·날짜·📅 칩 → 진행 막대 → 메모(두 줄) → 할 일 → ＋ 할 일
+  function card(p, i = 0, n = 0) {
+    const wait = busy.has(p.id);
+    const sortable = !p.done && n > 1;
+    const keepCard = (kind, el) => { rowEls.set(`${kind}:${p.id}`, { el, pid: p.id }); return el; };
+    const cardKey = (e) => {
+      if (e.isComposing) return;
+      const delta = e.key === 'ArrowUp' || e.key === 'ArrowLeft' ? -1 : e.key === 'ArrowDown' || e.key === 'ArrowRight' ? 1 : 0;
+      if (!delta) return;
+      e.preventDefault();
+      stepCard(p, delta, 'card-grip');
+    };
+    const confirming = confirmDel === p.id;
+    const others = (vm.todoGroups ?? []).flatMap((g) => g.items).filter((t) => t.projectId !== p.id && !t.pending);
+    const linked = linkedOf(p);
+    const folded = linked.length > FOLD_AT && !expanded.has(p.id) && drag?.pid !== p.id;
+    const shown = folded ? linked.slice(0, FOLD_AT) : linked;
+    const ul = h(`ul.mp-todos${drag?.pid === p.id ? '.is-dragging' : ''}`, { 'aria-label': tr('panel.pv44', { name: p.name }) }, shown.map((t, j) => todoRow(p, t, j, linked.length, wait)));
+    const fold = linked.length > FOLD_AT
+      ? keepCard('fold', h('button.ghost.mp-fold', {
+        type: 'button', 'aria-expanded': String(!folded),
+        onclick: () => { if (folded) expanded.add(p.id); else expanded.delete(p.id); refocus = { pid: p.id, tid: p.id, kind: 'fold' }; redrawCards(); },
+      }, folded ? tr('panel.pv45', { n: linked.length - FOLD_AT }) : tr('panel.pv46')))
+      : null;
+    if (drag?.pid === p.id) drag.ul = ul;
+    const toggleDone = () => act(p.id, () => cy.projectEdit(p.id, { status: p.done ? 'open' : 'done' }), p.done ? tr('panel.pv47') : tr('panel.pv20'));
+    const menu = keepCard('card-menu', ui.menuButton('mp-menu', {
+      label: tr('panel.pv48', { name: p.name }), title: tr('panel.pv49'), disabled: wait,
+      items: () => [
+        { label: tr('panel.pv50'), icon: '✎', onSelect: () => openEdit(p) },
+        ...(sortable ? [
+          { label: tr('panel.pv51'), icon: '↑', disabled: orderBusy || i === 0, onSelect: () => stepCard(p, -1, 'card-menu') },
+          { label: tr('panel.pv52'), icon: '↓', disabled: orderBusy || i === n - 1, onSelect: () => stepCard(p, 1, 'card-menu') },
+        ] : []),
+        { label: p.done ? tr('panel.pv53') : tr('panel.pv54'), icon: p.done ? '↺' : '✓', onSelect: toggleDone },
+        'sep',
+        { label: tr('panel.pv55'), danger: true, onSelect: () => { confirmDel = p.id; refocus = { pid: p.id, tid: p.id, kind: 'card-del' }; redrawCards(); } },
+      ],
+    }));
+    const due = p.dueBadge;
+    const meta = [
+      due ? h(`span.ui-badge.mp-due${p.dueTone === 'over' ? '.err' : p.dueTone === 'soon' ? '.warn' : ''}`, { text: due.badge, title: p.dueText }) : null,
+      dateRangeText(p) ? h('span.mp-date', { text: dateRangeText(p), title: p.dueText || undefined }) : null,
+      p.fromCalendar ? h('span.chip.mp-cal', { text: p.fromCalendar.calendar ? tr('panel.pv_from_cal_name', { calendar: p.fromCalendar.calendar }) : tr('panel.pv_from_cal'), title: p.fromCalendar.title ? tr('panel.pv56', { title: p.fromCalendar.title }) : tr('panel.pv57') }) : null,
+      p.done ? h('span.ui-badge.ok', { text: tr('panel.pv58') }) : null,
+    ].filter(Boolean);
+    const empty = !p.todos && !linked.length;
+    const el = h(`article.card.proj.mp.nodrag${p.done ? '.is-done' : ''}${wait ? '.busy' : ''}${empty ? '.is-empty' : ''}${cardDrag?.started && cardDrag.pid === p.id ? '.mp-card-dragging' : ''}`, { dataset: { id: p.id } },
+      sortable ? keepCard('card-grip', h('button.ghost.mp-card-grip.nodrag', {
+        type: 'button', title: tr('panel.pv59'), 'aria-label': tr('panel.pv60', { name: p.name, i: i + 1, n }), disabled: orderBusy,
+        onpointerdown: (e) => cardPointerDown(p, e), onkeydown: cardKey,
+      }, h('span.grip-dots', { 'aria-hidden': 'true' }))) : null,
+      h('div.head', null,
+        h('span.name', { text: p.name, title: p.name }),
+        keepCard('card-done', ui.iconBtn(`mp-done${p.done ? '.on' : ''}`, {
+          label: tr(p.done ? 'panel.pv61_reopen' : 'panel.pv61_done', { name: p.name }), title: p.done ? tr('panel.pv53') : tr('panel.pv62'), icon: p.done ? '↺' : '✓', disabled: wait, onclick: toggleDone,
+        })),
+        menu),
+      h('div.meta.mp-meta', null, meta.length ? meta : h('span.mp-date.none', { text: tr('panel.pv63') })), // 줄 자리를 카드끼리 맞춘다
+      p.todos ? ui.progress(p.todos - p.openTodos, p.todos, progressText(p)) : null,
+      p.note ? h('div.mp-note', { text: p.note, title: p.note }) : null,
+      linked.length ? ul : null,
+      fold,
+      p.done ? null : empty
+        ? h('div.mp-empty-body', null, adding === p.id ? null : h('span', { text: tr('panel.pv64') }), addRow(p, wait, others))
+        : h('div.mp-foot', null, addRow(p, wait, others)), // 카드 맨 아래에 붙는다(같은 줄 카드 높이를 맞춰도)
+      confirming
+        ? h('div.mp-actions.confirm', { role: 'alert' },
+          h('span', { text: p.todos ? tr('panel.pv65', { todos: p.todos }) : tr('panel.pv66') }),
+          h('span.spacer'),
+          keepCard('card-del', h('button.danger', { type: 'button', disabled: wait, onclick: () => { confirmDel = null; act(p.id, () => cy.projectDelete(p.id), tr('panel.pv67'), tr('panel.pv68', { name: p.name })); } }, tr('panel.pv55'))),
+          h('button.ghost', { type: 'button', onclick: () => { confirmDel = null; refocus = { pid: p.id, tid: p.id, kind: 'card-menu' }; redrawCards(); } }, tr('panel.pv69')))
+        : null);
+    if (!p.done) cardEls.set(p.id, el);
+    return el;
+  }
+
+  // ---- 만들기·고치기 창 ----
+  function openCreate() { modal = { step: 'choose', mode: 'new', draft: emptyDraft(), error: '' }; drawModal(); }
+  function openEdit(p) { modal = { step: 'form', mode: 'edit', id: p.id, cur: p, draft: draftOf(p), error: '' }; drawModal(); }
+  function close() { modal = null; drawModal(); }
+
+  async function loadEvents() {
+    modal = { ...modal, step: 'events', pick: { state: 'loading' } };
+    drawModal();
+    let r;
+    try { r = await cy.projectCalendarEvents(); } catch { r = { ok: false }; }
+    if (!modal || modal.step !== 'events') return;
+    modal = { ...modal, pick: shapePick(r) };
+    drawModal();
+  }
+
+  async function save() {
+    if (!modal || modal.saving) return;
+    const isNew = modal.mode === 'new';
+    const b = isNew ? createBody(modal.draft) : editBody(modal.cur, modal.draft);
+    if (b.error) { modal = { ...modal, error: b.error }; drawModal(); return; }
+    if (!isNew && !b.patch) { close(); return; }
+    modal = { ...modal, saving: true, error: '' };
+    drawModal();
+    let r;
+    try { r = await (isNew ? cy.projectCreate(b) : cy.projectEdit(modal.id, b.patch)); } catch { r = { ok: false }; }
+    if (!modal) return;
+    if (r?.ok) {
+      const name = isNew ? b.name : (b.patch.name ?? modal.cur.name);
+      close();
+      say(true, isNew ? tr('panel.pv70', { name }) : tr('panel.pv71', { name }));
+      onChanged();
+    } else {
+      modal = { ...modal, saving: false, error: tr('panel.pv72', { why: why(r) }) };
+      drawModal();
+    }
+  }
+
+  const field = (label, el) => h('label.mp-field', null, h('span.l', { text: label }), el);
+  function form() {
+    const d = modal.draft;
+    const set = (k) => (e) => { modal.draft = { ...modal.draft, [k]: e.target.value }; };
+    const name = h('input.mp-in', { type: 'text', value: d.name, placeholder: tr('panel.pv73'), 'aria-label': tr('panel.pv74'), oninput: set('name'), onkeydown: (e) => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); save(); } } });
+    const note = h('textarea.mp-in', { rows: '5', placeholder: tr('panel.pv75'), 'aria-label': tr('panel.pv76'), oninput: set('note') });
+    note.value = d.note;
+    queueMicrotask(() => name.focus());
+    return [
+      h('div.mp-m-head', null,
+        modal.mode === 'new' ? h('button.ghost.mp-back', { type: 'button', 'aria-label': tr('panel.pv77'), onclick: () => { modal = d.source ? { ...modal, step: 'events' } : { ...modal, step: 'choose' }; drawModal(); if (d.source && !modal.pick) loadEvents(); } }, '‹') : null,
+        h('h3', { id: 'mp-m-title', text: modal.mode === 'new' ? (d.source ? tr('panel.pv78') : tr('panel.pv79')) : tr('panel.pv80') })),
+      d.source ? h('div.mp-from', null, h('span.chip.mp-cal', { text: d.source.calendar ? tr('panel.pv_from_cal_name', { calendar: d.source.calendar }) : tr('panel.pv_from_cal') }), h('span.muted.small', { text: d.source.title || '' })) : null,
+      field(tr('panel.pv74'), name),
+      field(tr('panel.pv76'), note),
+      h('div.mp-dates', null,
+        field(tr('panel.pv81'), h('input.mp-in', { type: 'date', value: d.start, 'aria-label': tr('panel.pv81'), oninput: set('start') })),
+        field(tr('panel.pv82'), h('input.mp-in', { type: 'date', value: d.due, 'aria-label': tr('panel.pv82'), oninput: set('due') }))),
+      modal.error ? h('div.result.err', { role: 'alert', text: modal.error }) : null,
+      h('div.mp-m-foot', null,
+        h('span.spacer'),
+        h('button.ghost', { type: 'button', onclick: close }, tr('panel.pv69')),
+        h('button.primary', { type: 'button', disabled: modal.saving, onclick: save }, modal.saving ? tr('panel.pv83') : tr('panel.pv84'))),
+    ];
+  }
+
+  function choose() {
+    return [
+      h('div.mp-m-head', null, h('h3', { id: 'mp-m-title', text: tr('panel.pv4') })),
+      h('div.mp-choose', null,
+        h('button.mp-way', { type: 'button', onclick: () => { modal = { ...modal, step: 'form', draft: emptyDraft() }; drawModal(); } },
+          h('span.i', { text: '✏️' }), h('span.t', { text: tr('panel.pv85') }), h('span.d', { text: tr('panel.pv86') })),
+        h('button.mp-way', { type: 'button', onclick: loadEvents },
+          h('span.i', { text: '📅' }), h('span.t', { text: tr('panel.pv87') }), h('span.d', { text: tr('panel.pv88') }))),
+      h('div.mp-m-foot', null, h('span.spacer'), h('button.ghost', { type: 'button', onclick: close }, tr('panel.pv69'))),
+    ];
+  }
+
+  function events() {
+    const p = modal.pick ?? { state: 'loading' };
+    const pickRow = (ev) => h('button.mp-ev', {
+      type: 'button',
+      onclick: () => { modal = { ...modal, step: 'form', draft: draftFromPick(ev) }; drawModal(); },
+    },
+    h('span.when', { text: eventWhen(ev) }),
+    h('span.t', { text: ev.title, title: ev.title }),
+    h('span.sub', { text: [ev.calendar, ev.location].filter(Boolean).join(' · ') }));
+    let body;
+    if (p.state === 'loading') body = h('div.mp-ev-note', { role: 'status', text: tr('panel.pv89') });
+    else if (p.state === 'off') {
+      body = h('div.mp-ev-note', null,
+        h('div', { text: tr('panel.pv90') }),
+        h('button', { type: 'button', onclick: () => { close(); openSettings(); } }, tr('panel.pv91')));
+    } else if (p.state === 'error') {
+      body = h('div.mp-ev-note', null, h('div', { text: tr('panel.pv92') }), h('button', { type: 'button', onclick: loadEvents }, tr('panel.pv93')));
+    } else if (p.state === 'empty') body = h('div.mp-ev-note', { text: tr('panel.pv94') });
+    else {
+      body = h('div.mp-ev-list', null,
+        p.partial ? h('div.muted.small', { text: tr('panel.pv95') }) : null,
+        ...(p.upcoming.length ? [h('div.mp-ev-sec', { text: tr('panel.pv96') }), ...p.upcoming.map(pickRow)] : []),
+        ...(p.past.length ? [h('div.mp-ev-sec', { text: tr('panel.pv97') }), ...p.past.map(pickRow)] : []));
+    }
+    return [
+      h('div.mp-m-head', null,
+        h('button.ghost.mp-back', { type: 'button', 'aria-label': tr('panel.pv77'), onclick: () => { modal = { ...modal, step: 'choose' }; drawModal(); } }, '‹'),
+        h('h3', { id: 'mp-m-title', text: tr('panel.pv98') })),
+      body,
+      h('div.mp-m-foot', null, h('span.spacer'), h('button.ghost', { type: 'button', onclick: close }, tr('panel.pv69'))),
+    ];
+  }
+
+  function onKey(e) {
+    if (!modal || e.key !== 'Escape' || e.isComposing) return;
+    e.preventDefault();
+    e.stopPropagation(); // 패널 닫기(Esc)보다 먼저 창만 닫는다
+    close();
+  }
+  function drawModal() {
+    if (!modal) {
+      if (root) { root.remove(); root = null; document.removeEventListener('keydown', onKey, true); }
+      return;
+    }
+    if (!root) {
+      root = h('div.mp-scrim', { onmousedown: (e) => { if (e.target === root) close(); } });
+      document.body.append(root);
+      document.addEventListener('keydown', onKey, true);
+    }
+    const kids = modal.step === 'choose' ? choose() : modal.step === 'events' ? events() : form();
+    fill(root, h(`div.mp-modal.step-${modal.step}`, { role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'mp-m-title' }, kids));
+  }
+
+  // 캘린더 탭 일정 카드의 「프로젝트로 만들기」: 일정에서 가져오기와 같은 칸으로 바로 연다
+  function openFromPick(ev) { modal = { step: 'form', mode: 'new', draft: draftFromPick(ev), error: '' }; drawModal(); }
+
+  // 언어가 바뀜: 카드는 패널이 section() 으로 다시 그린다. 열린 만들기 창만 여기서 다시
+  const relang = () => { if (modal) drawModal(); };
+  return { section, openCreate, openFromPick, relang, isOpen: () => !!modal };
+}
