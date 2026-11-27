@@ -6,6 +6,8 @@
 
 ## 바로 설치하기
 
+**Codex로 설치하려면:** [Codex용 설치 안내 Markdown](INSTALL_WITH_CODEX.md)을 전달하고 “이 파일대로 시사를 설치해줘”라고 요청하세요.
+
 ### [⬇ Windows 설치 파일 받기](https://github.com/jangyunseo-ineeji/shisa-windows-share/releases/download/v0.3.2-share.1/Shisa-0.3.2-Setup.exe)
 
 1. 위 링크에서 `Shisa-0.3.2-Setup.exe`를 받습니다.
